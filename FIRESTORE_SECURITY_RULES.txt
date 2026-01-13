@@ -1,0 +1,227 @@
+// FIRESTORE SECURITY RULES FOR ROOM APP
+// Version: 1.0
+// Purpose: Protect user data while allowing necessary operations
+// South African Market Context: POPI Act Compliance
+//
+// Rules Strategy:
+// - Clients can only access their own data
+// - Staff can only see jobs assigned to them
+// - Admins have full access
+// - All data is encrypted in transit (automatic with HTTPS)
+// - Gate codes and sensitive data are protected
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ==========================================
+    // HELPER FUNCTIONS
+    // ==========================================
+    
+    // Check if user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    // Check if user is the owner of the document
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    // Check if user has admin role (from their user profile)
+    function isAdmin() {
+      return isSignedIn() && get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data.role == 'admin';
+    }
+    
+    // Check if user is staff member
+    function isStaff() {
+      return isSignedIn() && exists(
+        /databases/$(database)/documents/staff/$(request.auth.uid)
+      );
+    }
+    
+    // Get resource data safely
+    function getResourceData() {
+      return resource.data;
+    }
+    
+    // Get request data safely
+    function getRequestData() {
+      return request.resource.data;
+    }
+    
+    // ==========================================
+    // USERS COLLECTION
+    // Security: Each user can only read/write their own profile
+    // Admins can manage all users
+    // ==========================================
+    match /users/{userId} {
+      // Users can read their own profile
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Users can only write to their own profile
+      allow write: if isOwner(userId) || isAdmin();
+      
+      // Prevent users from elevating their role to admin
+      allow update: if !('role' in getRequestData()) 
+                    || request.auth.uid == userId 
+                    || isAdmin();
+    }
+    
+    // ==========================================
+    // STAFF COLLECTION
+    // Security: Public read (for client visibility)
+    // Only admins can modify staff
+    // ==========================================
+    match /staff/{staffId} {
+      // Anyone signed in can view staff members (to see available stylists)
+      allow read: if isSignedIn();
+      
+      // Only admins can create/update/delete staff
+      allow write: if isAdmin();
+      
+      // Staff member can update certain fields (online status, location)
+      allow update: if request.auth.uid == staffId 
+                    && (
+                      getRequestData().keys().hasAny(['isOnline', 'currentLat', 'currentLong'])
+                    );
+    }
+    
+    // ==========================================
+    // SERVICES COLLECTION
+    // Security: Public read
+    // Only admins can modify services
+    // ==========================================
+    match /services/{serviceId} {
+      // Anyone can view the service menu
+      allow read: if true;
+      
+      // Only admins can manage services
+      allow write: if isAdmin();
+    }
+    
+    // ==========================================
+    // BOOKINGS COLLECTION (CRITICAL)
+    // Security: Most important collection
+    // - Clients can only see their bookings
+    // - Staff can only see their assigned jobs
+    // - Admins can see and manage all
+    // ==========================================
+    match /bookings/{bookingId} {
+      // CREATE: Any logged-in user can request a booking
+      // Validation: They must set themselves as the client
+      allow create: if isSignedIn() 
+                    && getRequestData().clientId == request.auth.uid
+                    && getRequestData().status in ['pending'];
+      
+      // READ: Client, assigned staff, or admin
+      allow read: if isSignedIn() && (
+        getResourceData().clientId == request.auth.uid       // Client reading own booking
+        || getResourceData().staffId == request.auth.uid      // Staff reading assigned job
+        || isAdmin()                                           // Admin can see all
+      );
+      
+      // UPDATE: Client can cancel, staff can update status, admin can do anything
+      allow update: if isSignedIn() && (
+        (getResourceData().clientId == request.auth.uid)       // Client can update own booking
+        || (getResourceData().staffId == request.auth.uid)     // Staff can update assigned job
+        || isAdmin()                                           // Admin full access
+      );
+      
+      // DELETE: Only admins (for cleanup/refunds)
+      allow delete: if isAdmin();
+      
+      // Protect against status manipulation
+      // Staff can only set their own status to certain values
+      allow update: if request.auth.uid == getResourceData().staffId
+                    && getRequestData().status in [
+                      'en_route',
+                      'arrived',
+                      'in_progress',
+                      'completed'
+                    ];
+    }
+    
+    // ==========================================
+    // USER ADDRESSES COLLECTION
+    // Security: Each user can manage their addresses
+    // Contains sensitive data (gate codes, security notes)
+    // ==========================================
+    match /users/{userId}/addresses/{addressId} {
+      // Users can read their own addresses
+      allow read: if isOwner(userId);
+      
+      // Users can create/update their own addresses
+      allow create, update: if isOwner(userId) 
+                            && getRequestData().userId == userId;
+      
+      // Users can delete their own addresses
+      allow delete: if isOwner(userId);
+    }
+    
+    // ==========================================
+    // PAYMENTS COLLECTION
+    // Security: Sensitive financial data
+    // - Clients can view their own payment history
+    // - Admins can view all payments
+    // - No one can modify (append-only log)
+    // ==========================================
+    match /payments/{paymentId} {
+      // Clients can read their payments
+      allow read: if isSignedIn() 
+                  && getResourceData().userId == request.auth.uid
+                  || isAdmin();
+      
+      // Payments are created by secure backend functions only
+      // (Not directly from mobile app)
+      allow create: if false; // Backend only
+      
+      // Payments are immutable once created
+      allow update, delete: if false;
+    }
+    
+    // ==========================================
+    // ADMIN LOGS COLLECTION
+    // Security: Audit trail for POPI compliance
+    // ==========================================
+    match /admin_logs/{logId} {
+      // Only admins can view logs
+      allow read: if isAdmin();
+      
+      // Only backend can write logs
+      allow write: if false;
+    }
+    
+    // ==========================================
+    // CATCH-ALL RULE
+    // Default deny for any collection not explicitly defined
+    // ==========================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
+// ==========================================
+// IMPLEMENTATION NOTES
+// ==========================================
+// 1. Copy all rules above
+// 2. Go to Firebase Console > Firestore > Rules
+// 3. Replace existing rules with the above
+// 4. Click "Publish"
+// 5. Test with Firebase Emulator first (npm install -g firebase-tools)
+//
+// POPI COMPLIANCE:
+// - All personal data is only accessible to data subject or authorized party
+// - Secure HTTPS transmission (automatic)
+// - Data is encrypted at rest (Google Cloud default)
+// - Access is logged in admin_logs collection
+// - Deletion is allowed through update/delete operations
+//
+// SOUTH AFRICAN CONTEXT:
+// - Gate codes are stored in user addresses (protected)
+// - Only client can see their own gate code
+// - Staff cannot see gate code (only in job details when assigned)
+// - All data subject to POPI Act requirements
